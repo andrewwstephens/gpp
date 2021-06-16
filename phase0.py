@@ -1,230 +1,161 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+import argparse
+from   astropy.io import ascii
+import logging
+import numpy
+import sys
 
-# Experiments with a Phase 0 tool
-# Bryan Miller
+# Data at https://docs.google.com/spreadsheets/d/1-Rz-uqEU3AM3LiDMLYS2rbh5PrSDp3cdyjF7flV_Ztg/
 
-from __future__ import print_function
-# from astropy.table import Table
-from astropy.io import ascii
-import numpy as np
+__version__ = '2019-Feb-12'  # Bryan Miller, original version
+__version__ = '2021-Jun-16'  # astephens, separate imaging and spectroscopy spreadsheets
 
-instmodes = ascii.read("phase0_Instrument_Matrix.tsv",format='tab')
+def main(args):
+    logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S', level=getattr(logging, args.loglevel.upper()))
+    logger = logging.getLogger()
 
-# For ToOs instmodes could be limited by what is on the telescope and installed in the instruments
+    if args.mode == 'imaging':
+        configfile = 'phase0.imaging.csv'
+    else:
+        configfile = 'phase0.spectroscopy.csv'
+    instmodes = ascii.read(configfile, format='csv')
+    nrows = len(instmodes)
+    logger.debug('Read %d instrument modes from %s', nrows, configfile)
+    logger.debug('instmodes:\n%s', instmodes)
 
-# print(instmodes)
-# nrows = instmodes.__sizeof__()
-nrows = len(instmodes['mode'])
-print(nrows)
+    if args.mode == 'imaging':
+        instmodes['filters'] = [s.split(',') for s in instmodes['filters']]  # convert string to list
+        filtermatch = numpy.array([len(set(args.filter) & set(f)) > 0 for f in instmodes['filters']])
+        logger.debug('filtermatch: %s', filtermatch)
+        aomatch = (instmodes['AO'] == 'yes') if (args.iq < 0.2) else numpy.full(nrows, True)  # Allow AO even if not needed
+        logger.debug('aomatch: %s', aomatch)
+        specklematch = (instmodes['capabilities'] == 'speckle').filled(False) if ('speckle' in args.capabilities) else (instmodes['capabilities'] != 'speckle').filled(True)
+        logger.debug('specklematch: %s', specklematch)
+        idx = numpy.where((instmodes['FoV'] >= args.fov) & filtermatch & aomatch & specklematch)[0]
 
-#################
-# Imaging
+    elif args.mode == 'spectroscopy':
+        logger.debug('capabilities: %s', args.capabilities)
+        logger.debug('instmodes[capabilities]: %s', instmodes['capabilities'])
+        instmodes['Focal Plane'] = [s.split(',') for s in instmodes['Focal Plane']]  # convert string to list
+        fpmatch = [args.fpu in f for f in instmodes['Focal Plane']]
+        logger.debug('fpmatch: %s', fpmatch)
+        nsmatch = (instmodes['capabilities'] == 'Nod&Shuffle').filled(False) if ('nodshuffle' in args.capabilities) else (instmodes['capabilities'] != 'Nod&Shuffle').filled(True)
+        logger.debug('nsmatch: %s', nsmatch)
+        aomatch = (instmodes['AO'] == 'yes') if (args.iq < 0.2) else numpy.full(nrows, True)
+        logger.debug('aomatch: %s', aomatch)
+        coronamatch = (instmodes['capabilities'] == 'coronagraph').filled(False) if ('coronagraph' in args.capabilities) else (instmodes['capabilities'] != 'coronagraph').filled(True)
+        logger.debug('coronamatch: %s', coronamatch)
+        idx = numpy.where(
+            (instmodes['wave min'] <= args.wave) &
+            (instmodes['wave max'] >= args.wave) &
+            (instmodes['resolution'] >= args.res) &
+            (instmodes['wave range'] >= args.range) &
+            (instmodes['slit length'] >= args.fov) &
+            fpmatch & nsmatch & aomatch & coronamatch)[0]
 
-mode = 'Imaging'
-wlen = 2.15
-dwmin = 0.0
-dwmax = 'Any'
-iqmax = 0.1
-fov = 60.
-coron = 'No'
-# Minimum exposure time (to select a fast read mode?)
-minexp = 1.0
+    logger.debug('idx: %s', idx)
+    nmatch = len(idx)
+    logger.debug('Found %d matches!\n' % nmatch)
 
-if dwmax == 'Any':
-    l_dwmax = 10.0
-else:
-    l_dwmax = dwmax
+    if args.mode == 'imaging':
+        print('Field of View:', args.fov)
+        print('Filters:', args.filter)
+    elif args.mode == 'spectroscopy':
+        print('Focal Plane: %s' % args.fpu)
+        print('Central Wavelength: %0.3f um' % args.wave)
+        print('Spectral Resolution: %d' % args.res)
+        print('Slit Length: %0.1f arcsec' % args.fov)
+    print('Special Capabilities: %s' % args.capabilities)
 
-if dwmin == 'Any':
-    l_dwmin = 0.0
-else:
-    l_dwmin = dwmin
+    print('\nMatching configurations:')
+    if args.mode == 'imaging':  # Just print the matching configurations
+        for i in idx:
+            print(instmodes['instrument'][i])
+    elif args.mode == 'spectroscopy':  # prioritize the configurations since there may be many
+        delta_wav = numpy.abs(instmodes['wave optimal'] - args.wave)     # Difference in wavelength
+        delta_slit_width = numpy.abs(instmodes['slit width'] - args.iq)  # Difference in slit width
+        delta_res = numpy.abs(instmodes['resolution'] - args.res)        # Difference in resolution
+        score = numpy.zeros(nrows)
+        for i in idx:
 
-if fov == 'Any':
-    l_fov = 1.0
-else:
-    l_fov = fov
+            if args.iq > 0.2 and instmodes['AO'][i] == 'no':  # give a bump to non-AO modes (but don't discount them)
+                score[i] += 0.5
 
-if iqmax == 'Any':
-    l_iqmax = 10.0
-else:
-    l_iqmax = iqmax
+            score[i] += args.wave/(args.wave + delta_wav[i])  # Wavelength match
 
-# Difference in central wavelength
-dcw = np.abs(instmodes['wavelength'] - wlen)
-# print(dw)
+            # If wavelength > 0.65mu, then prefer settings with a filter to avoid 2nd order contamination
+            if args.wave > 0.65 and instmodes['filter'][i] != 'none':
+                score[i] += 0.5
 
-# Select all optioms that meet the requirements
-ii = np.where(np.logical_and(instmodes['mode'] == mode.lower(),
-              np.logical_and(instmodes['band_width'] >= l_dwmin,
-              np.logical_and(instmodes['band_width'] <= l_dwmax,
-              np.logical_and(instmodes['coronagraph'] == coron.lower(),
-              np.logical_and(instmodes['minexp'] <= minexp,
-              np.logical_and(instmodes['iq_min'] <= l_iqmax, np.logical_and(instmodes['fov'] >= l_fov,
-              np.logical_and(instmodes['grcwlen_min'] <= wlen, instmodes['grcwlen_max'] >= wlen)))))))))[0]
+            score[i] += args.res/(args.res + delta_res[i])  # Resolution match
 
-nmatch = len(ii)
-score = np.zeros(nrows)
-irec = []
+            if 'ifu' in instmodes['Focal Plane'][i]:  # Slit width match to the seeing (the IFU always matches)
+                score[i] += 1.0
+            else:
+                score[i] += args.iq / (args.iq + delta_slit_width[i])
 
-print()
-print(mode)
-if len(ii) == 0:
-    print('No options found.')
-else:
-    # print()
-    # print('Options:')
-    # Try to make a recommendation if multiple options, try to choose the least restrictive
-    # Could also use target visibility to decide if options are from different sites
+        print('Instrument  FPU                 Disperser  Filter Resolution  Score')
+        for i in numpy.flip(numpy.argsort(score)):
+            if score[i] > 0:
+                print('%-11s %-19s %-10s %-8s %8d %6.3f' %
+                      (instmodes['instrument'][i], instmodes['fpu'][i], instmodes['disperser'][i],
+                       instmodes['filter'][i], instmodes['resolution'][i], score[i]))
 
-    for i in ii:
-        # Configuration match
-        score[i] += 1
+# --------------------------------------------------------------------------------------------------
 
-        # Prefer non-AO if not required for IQ
-        if 'no' in instmodes['ao'][i].lower():
-            score[i] += 1
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description='Phase 0 experimentation.\n\n' +
+        'examples:\n' +
+        '  phase0.py  imaging  --filter r \n' +
+        '  phase0.py  imaging  --filter K  --iq 0.1\n' +
+        '  phase0.py  imaging  --filter g  --capabilities speckle\n' +
+        '  phase0.py  spectroscopy  --wave 0.61  --res 1000  --iq 0.8\n' +
+        '  phase0.py  spectroscopy  --wave 0.55  --range 0.3 --capabilities nodshuffle\n' +
+        '  phase0.py  spectroscopy  --fpu multislit --wave 0.48  --res 2000\n' +
+        '  phase0.py  spectroscopy  --wave 1.65  --range 2.0\n' +
+        '  phase0.py  spectroscopy --fpu ifu --wave 2.2\n'
+        '  phase0.py  spectroscopy  --wave 2.2  --capabilities coronagraph',
+        epilog='Version: ' + __version__)
 
-        # Central wavelength match
-        # if dcw[i] == dcwmin:
-        #     score[i] += 1
-        dcwscore = wlen/(wlen + dcw[i])
-        score[i] += dcwscore
+    parser.add_argument('mode', default=None, type=str,
+                        choices=['imaging', 'spectroscopy'])
 
-        # print(instmodes['instrument'][i], instmodes['filter'][i], score[i])
+    parser.add_argument('--filter', default=None, type=str, action='append',
+                        help='Imaging filter')
 
-    isort = np.argsort(score)
-    # Reverse order, high to low
-    # ir = np.array([isort[-(j+1)] for j in range(nmatch)])
-    ir = np.flip(isort,axis=0)
+    parser.add_argument('--fpu', default='singleslit', type=str, action='store',
+                        choices=['singleslit', 'multislit', 'ifu'],
+                        help='Spectroscopy focal plane unit [singleslit]')
 
-    print()
-    print('Recommendations:')
-    for i in range(nmatch):
-        irec.append(ir[i])
-        print('{:12s} {:10s} {:5.2f}'.format(instmodes['instrument'][ir[i]], instmodes['filter'][ir[i]], score[ir[i]]))
+    parser.add_argument('--fov', default=1.0, type=float, action='store',
+                        help='Field of view or slit length (arcsec)')
 
-#################
-# Spectroscopy
+    parser.add_argument('--res', action='store', type=int, default=1,
+                        help='Spectral resolution')
 
-mode = 'Spec'
-wlen = 0.8
-dwmin = 0.0
-dwmax = 'Any'
-rmin = 300.
-iqmax = 1.0  # proxy for slit width
-fov = 'Any'
-dims = 1
-coron = 'No'
-mos = 'No'
-# Normal/high quality sky subtraction (to select N&S if target brightness
-# not available?
-skysub = 'High' # normal, high
-minexp = 1.0
+    parser.add_argument('--wave', action='store', type=float, default=0.5,
+                        help='Spectroscopy central wavelength (microns)')
 
-if dwmin == 'Any':
-    l_dwmin = 0.0
-else:
-    l_dwmin = dwmin
+    parser.add_argument('--range', action='store', type=float, default=0.0,
+                        help='Spectroscopy wavelength range (microns)')
 
-if dwmax == 'Any':
-    l_dwmax = 10.0
-else:
-    l_dwmax = dwmax
+    parser.add_argument('--iq', action='store', type=float, default=1.0,
+                        help='Image quality (arcseconds)')
 
-if fov == 'Any':
-    l_fov = 1.0
-else:
-    l_fov = fov
+    parser.add_argument('--capabilities', default=[None], type=str, action='append',
+                        choices=['nodshuffle', 'speckle', 'coronagraph'])
 
-if iqmax == 'Any':
-    l_iqmax = 10.0
-else:
-    l_iqmax = iqmax
+    parser.add_argument('--loglevel', type=str, default='info',
+                        choices=['debug', 'info', 'warning', 'error'])
 
-# High sky subtraction (N&S) only for the optical, for now
-if wlen >= 1.0:
-    l_skysub = 'normal'
-else:
-    l_skysub = skysub.lower()
+    args = parser.parse_args(args=None if sys.argv[1:] else ['--help'])
 
-# Difference in central wavelength
-dcw = np.abs(instmodes['wavelength'] - wlen)
-# print(dw)
+    if args.mode == 'imaging' and args.filter is None:
+        args.filter = ['r']  # parser.error('Please specify an imaging filter')
 
-# Difference in slit width
-ds = np.abs(instmodes['slit_width'] - l_iqmax)
-# print(dw)
+    main(args)
 
-# Difference in resolution
-dr = np.abs(instmodes['resolution'] - rmin)
-
-# Criteria matching
-ii = np.where(np.logical_and(instmodes['mode'] == mode.lower(),
-              np.logical_and(instmodes['resolution'] >= rmin,
-              np.logical_and(instmodes['spatial_dims'] >= dims,
-              np.logical_and(instmodes['band_width'] >= l_dwmin,
-              np.logical_and(instmodes['band_width'] <= l_dwmax,
-              np.logical_and(instmodes['coronagraph'] == coron.lower(),
-              np.logical_and(instmodes['minexp'] <= minexp,
-              np.logical_and(instmodes['mos'] == mos.lower(),
-              np.logical_and(instmodes['skysub'] == l_skysub.lower(),
-              np.logical_and(instmodes['iq_min'] <= l_iqmax, np.logical_and(instmodes['fov'] >= l_fov,
-              np.logical_and(instmodes['grcwlen_min'] <= wlen, instmodes['grcwlen_max'] >= wlen)))))))))))))[0]
-
-nmatch = len(ii)
-score = np.zeros(nrows)
-# print(nrows, nmatch, len(ii))
-# print(ii)
-irec = []
-
-print()
-print(mode)
-if nmatch == 0:
-    print('No options found.')
-else:
-    # print()
-    # print('Options:')
-    for i in ii:
-        # Configuration match
-        score[i] += 1.
-
-        # Prefer non-AO if not required for IQ
-        if 'no' in instmodes['ao'][i].lower():
-            score[i] += 1.
-
-        # Wavelength match
-        dcwscore = wlen/(wlen + dcw[i])
-        score[i] += dcwscore
-
-        # If wavelength > 0.65mu, then prefer settings with a filter (avoid 2nd order)
-        if mode.lower() == 'spec' and wlen > 0.65 and instmodes['filter'][i] != 'none':
-            score[i] += 0.5
-
-        # Resolution match
-        score[i] += rmin/(rmin + dr[i])
-
-        # Slit width match, IFU and MOS always matches
-        if int(instmodes['spatial_dims'][i]) == 2 or 'yes' in instmodes['mos'][i].lower():
-            score[i] += 1.
-        else:
-            score[i] += l_iqmax/(l_iqmax + ds[i])
-
-        # Could include a term for sensitivity (S/N) if info available
-
-        # print(instmodes['instrument'][i], instmodes['resolution'][i], instmodes['disperser'][i],
-        #       instmodes['filter'][i], instmodes['fpu'][i], dcwscore, score[i])
-
-    isort = np.argsort(score)
-    # Reverse, high to low
-    # ir = np.array([isort[-(j+1)] for j in range(nmatch)])
-    ir = np.flip(isort,axis=0)
-
-    print()
-    print('Recommendations:')
-    for i in range(nmatch):
-        irec.append(ir[i])
-        print('{:12s} {:7.0f} {:6s} {:10s} {:18s} {:3s} {:5.2f}'.format(instmodes['instrument'][ir[i]], instmodes['resolution'][ir[i]], instmodes['disperser'][ir[i]],
-              instmodes['filter'][ir[i]], instmodes['fpu'][ir[i]], instmodes['ao'][ir[i]], score[ir[i]]))
-
-
+# --------------------------------------------------------------------------------------------------
