@@ -35,8 +35,6 @@ def main(args):
         idx = numpy.where((instmodes['FoV'] >= args.fov) & filtermatch & aomatch & specklematch)[0]
 
     elif args.mode == 'spectroscopy':
-        logger.debug('capabilities: %s', args.capabilities)
-        logger.debug('instmodes[capabilities]: %s', instmodes['capabilities'])
         instmodes['Focal Plane'] = [s.split(',') for s in instmodes['Focal Plane']]  # convert string to list
         fpmatch = [args.fpu in f for f in instmodes['Focal Plane']]
         logger.debug('fpmatch: %s', fpmatch)
@@ -116,8 +114,8 @@ if __name__ == '__main__':
         '  phase0.py  spectroscopy  --wave 0.55  --range 0.3 --capabilities nodshuffle\n' +
         '  phase0.py  spectroscopy  --fpu multislit --wave 0.48  --res 2000\n' +
         '  phase0.py  spectroscopy  --wave 1.65  --range 2.0\n' +
-        '  phase0.py  spectroscopy --fpu ifu --wave 2.2\n'
-        '  phase0.py  spectroscopy  --wave 2.2  --capabilities coronagraph',
+        '  phase0.py  spectroscopy  --fpu ifu --wave 2.2\n'
+        '  phase0.py  spectroscopy  --fpu ifu --wave 2.2  --capabilities coronagraph',
         epilog='Version: ' + __version__)
 
     parser.add_argument('mode', default=None, type=str,
